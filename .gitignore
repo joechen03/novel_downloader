@@ -1,0 +1,10 @@
+# 程式自動產生的本機資料
+chrome_profile/
+.novel_cache/
+site_rates.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

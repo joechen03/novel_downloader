@@ -1,0 +1,4 @@
+selenium>=4.11
+beautifulsoup4>=4.12
+lxml>=4.9
+opencc>=1.1

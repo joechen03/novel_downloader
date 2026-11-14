@@ -38,6 +38,9 @@ SITE_CASES = [
     ("czbooks_toc", "折月亮", "小說狂人", 236, "第1頁", "第236頁"),
     ("hjwzw_toc", "術師手冊", "黃金屋", 1381, "第1章 我被逮捕了", "番外·職場的術師手冊(下)"),
     ("ixdzs_toc", "封總，太太想跟你離婚很久了", "愛下電子書", 757, "第1章  她該清醒了", "第757章  直接證據"),
+    # 69shuba：書名是簡體（main 會再轉繁體）；目錄名稱在瀏覽器中被轉成繁體
+    ("69shuba_toc", "霍格沃茨的学习面板", "69书吧", 569, "第1章 1：倫敦孤兒", "第568章 566：任意門"),
+    ("ttkan_toc", "萬相之王", "天天看", 1838, "第1章 我有三個相宮", "第1838章 大結局"),
 ]
 
 
@@ -194,7 +197,7 @@ class TestContent(unittest.TestCase):
         self.assertIsNotNone(s.find("script"))
 
     def test_parse_chapter_html_title(self):
-        title, content, cont = nd.parse_chapter_html(chapter_html(self.TEXT, title="第3章 真正的標題"),
+        title, content, cont, page_title = nd.parse_chapter_html(chapter_html(self.TEXT, title="第3章 真正的標題"),
                                                      "https://a.com/b/1/3.html", "第3章")
         self.assertEqual(title, "第3章 真正的標題")
         self.assertIsNone(cont)
@@ -217,7 +220,7 @@ class TestCacheAndBook(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.output = os.path.join(self.tmp.name, "書_站.txt")
-        self.path = nd.cache_path(self.output)
+        self.path = nd.cache_path(os.path.join(self.tmp.name, "書_站"))
         nd.CONVERTER.update(enabled=False)
 
     def tearDown(self):
@@ -290,6 +293,8 @@ class TestRate(unittest.TestCase):
         self.assertIsNone(nd.learned_rate({"c": 8, "rate": 0}))
         self.assertEqual(nd.learned_rate({"ok": [10, 12.5, 15.6, 12], "limited": [19.5, 15.6]}), 12.5)
         self.assertIsNone(nd.learned_rate({"ok": [], "limited": [2.0]}))
+        self.assertIsNone(nd.learned_rate({"ok": [5, 6.25]}))  # 沒被擋過：不代表網站上限
+        self.assertEqual(nd.learned_rate({"ok": [10, 12.5], "limited": [float("inf")]}), 12.5)
 
     def test_site_rate_file(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,4 +1,4 @@
-"""通用小說下載器：輸入目錄頁網址，自動找出所有章節並下載成 txt。
+"""通用小說下載器：輸入目錄頁網址，自動找出所有章節並下載成 txt / EPUB。
 
 不針對特定網站寫死 XPath，而是用啟發式規則判斷：
   * 目錄頁：找出「網址格式相同、數量最多」的一組連結，視為章節列表
@@ -11,21 +11,28 @@
     python novel_downloader.py https://uukanshu.cc/book/17472/
     python novel_downloader.py https://uukanshu.cc/book/17472/ --list          # 只列出章節，不下載
     python novel_downloader.py https://uukanshu.cc/book/17472/ --end 100       # 只下載前 100 章
-    （中斷後重新執行同一指令即可接續：已下載的章節存在 .novel_cache/，會自動略過）
+    python novel_downloader.py https://uukanshu.cc/book/17472/ --format epub   # 輸出 EPUB
+    （輸出到 downloads/；中斷後重新執行同一指令即可接續，已下載的章節會自動略過）
     python novel_downloader.py https://example.com/book/1/1.html --mode next   # 從某章一路抓「下一章」
 """
 
 import argparse
 import json
+import html as html_lib
 import os
 import re
+import signal
 import statistics
+import subprocess
 import time
+import uuid
+import zipfile
 from collections import OrderedDict, defaultdict
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, Comment, NavigableString
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import (SessionNotCreatedException, UnexpectedAlertPresentException,
                                         WebDriverException)
 
@@ -34,6 +41,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 專用的 Chrome 設定檔（第一次執行時自動建立），保存 Cookie 與 Cloudflare 驗證狀態
 CHROME_PROFILE = os.path.join(BASE_DIR, "chrome_profile")
 SITE_RATES_FILE = os.path.join(BASE_DIR, "site_rates.json")  # 各網站學到的速度上限
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")  # 預設輸出資料夾
 CACHE_DIRNAME = ".novel_cache"  # 已下載章節的暫存資料夾（建在輸出檔旁邊）
 MAX_TOC_PAGES = 200      # 分頁目錄最多抓幾頁
 
@@ -59,7 +67,48 @@ REMOVE_TAGS = ["script", "style", "noscript", "iframe", "header", "footer", "nav
 # ---------------------------------------------------------------------------
 # 瀏覽器
 # ---------------------------------------------------------------------------
+def kill_stale_chrome(profile_dir: str) -> int:
+    """關閉還在使用指定設定檔的 Chrome（上次程式被強制結束時殘留的）。回傳關閉的程序數。
+    只用在本程式專用的設定檔，不會動到使用者平常開的 Chrome。"""
+    # 子程序的參數是 --user-data-dir="路徑"（有引號），主程序沒有；所以只比對路徑本身，且不分大小寫
+    needle = os.path.abspath(profile_dir)
+    try:
+        if os.name == "nt":
+            ps = ("$p = '%s'.ToLower(); $n = 0; Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                  "Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains('--user-data-dir') "
+                  "-and $_.CommandLine.ToLower().Contains($p) } | "
+                  "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; $n++ } catch {} }; $n"
+                  % needle.replace("'", "''"))
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=60).stdout.strip()
+            return int(out.splitlines()[-1]) if out else 0
+        out = subprocess.run(["pkill", "-f", "-e", "--", needle], capture_output=True, text=True, timeout=60).stdout
+        return len(out.splitlines())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
 def build_driver(profile_dir: str, headless: bool) -> webdriver.Chrome:
+    try:
+        return _start_chrome(profile_dir, headless)
+    except SessionNotCreatedException as e:
+        error = e
+    # 專用設定檔被上次殘留的 Chrome 佔用：關掉殘留程序後再試一次
+    if profile_dir and os.path.abspath(profile_dir) == os.path.abspath(CHROME_PROFILE):
+        killed = kill_stale_chrome(profile_dir)
+        if killed:
+            print(f"已關閉 {killed} 個上次殘留的 Chrome 程序，重新啟動…")
+            time.sleep(2)
+            try:
+                return _start_chrome(profile_dir, headless)
+            except SessionNotCreatedException as e:
+                error = e
+    hint = (f"\n  設定檔「{profile_dir}」可能正被另一個 Chrome 視窗使用，請關閉後再試，"
+            "或用 --profile 指定其他資料夾。") if profile_dir else ""
+    raise RuntimeError(f"無法啟動 Chrome：{error.msg}{hint}") from error
+
+
+def _start_chrome(profile_dir: str, headless: bool) -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
     if profile_dir:
         options.add_argument(f"--user-data-dir={profile_dir}")
@@ -70,12 +119,13 @@ def build_driver(profile_dir: str, headless: bool) -> webdriver.Chrome:
     options.add_argument("--log-level=3")
     options.add_experimental_option("excludeSwitches", ["enable-logging"])
     options.page_load_strategy = "eager"  # DOM 就緒即可，不等圖片/廣告
-    try:
-        return webdriver.Chrome(options=options)
-    except SessionNotCreatedException as e:
-        hint = (f"\n  設定檔「{profile_dir}」可能正被另一個 Chrome 視窗使用，請關閉後再試，"
-                "或用 --profile 指定其他資料夾。") if profile_dir else ""
-        raise RuntimeError(f"無法啟動 Chrome：{e.msg}{hint}") from e
+    # chromedriver 放在獨立的程序群組：按 Ctrl+C 時才不會連它一起被結束，
+    # 否則程式無法關閉 Chrome，會殘留一堆 Chrome 程序並佔住設定檔
+    if os.name == "nt":
+        service = Service(popen_kw={"creation_flags": subprocess.CREATE_NEW_PROCESS_GROUP})
+    else:
+        service = Service(popen_kw={"start_new_session": True})
+    return webdriver.Chrome(options=options, service=service)
 
 
 def load_soup(driver, url: str, ready=None) -> BeautifulSoup:
@@ -121,9 +171,17 @@ def url_pattern(url: str) -> str:
     return f"{head}/*" + (f".{ext}" if ext else "")
 
 
+_BOOK_NAME_SUFFIX = re.compile(r"(最新章[節节]列表|最新章[節节]|章[節节]列表|章[節节]目[錄录]|全文目[錄录]"
+                               r"|全文[閱阅][讀读]|免[費费][閱阅][讀读]|在[線线][閱阅][讀读]|線上看|txt下[載载])$",
+                               re.IGNORECASE)
+
+
 def _clean_book_name(name: str) -> str:
     name = re.sub(r"【[^】]*】|\[[^\]]*\]", "", name)  # 【完結+番外】等標記
-    return name.strip(" 　_-|｜")
+    name = name.strip(" 　_-|｜")
+    while _BOOK_NAME_SUFFIX.search(name) and len(_BOOK_NAME_SUFFIX.sub("", name)) >= 2:
+        name = _BOOK_NAME_SUFFIX.sub("", name).strip(" 　_-|｜")  # 霍格沃茨的學習面板最新章節列表 → 霍格沃茨的學習面板
+    return name
 
 
 def extract_book_name(soup: BeautifulSoup) -> str:
@@ -145,6 +203,15 @@ def extract_book_name(soup: BeautifulSoup) -> str:
             return _clean_book_name(text)
     first = re.split(r"[_\-|｜,，/]", meta("og:title") or title or "novel")[0]
     return _clean_book_name(first) or "novel"
+
+
+def extract_author(soup: BeautifulSoup) -> str:
+    """作者（EPUB 用）：og:novel:author / book:author / meta author，取不到回傳空字串。"""
+    for attrs in ({"property": "og:novel:author"}, {"property": "book:author"}, {"name": "author"}):
+        m = soup.find("meta", attrs=attrs)
+        if m and m.get("content", "").strip():
+            return m["content"].strip()
+    return ""
 
 
 _EXPAND_TOC_TEXT = re.compile(r"查看完整|完整目錄|完整目录|全部章節|全部章节|查看全部|展開目錄|展开目录|章節目錄>>|更多章節|更多章节")
@@ -347,6 +414,34 @@ def _direct_text_score(el) -> int:
     return score
 
 
+_KEY_CONVERTER = {}
+
+
+def title_key(text: str) -> str:
+    """比對標題用的正規化：去掉空白，有 OpenCC 時再轉成簡體。
+    同一網站的目錄和章節頁可能一個繁體、一個簡體（69shuba 的目錄頁會被轉成繁體，正文仍是簡體）。"""
+    text = re.sub(r"\s+", "", text or "")
+    if "t2s" not in _KEY_CONVERTER:  # 子進程不會執行 setup_converter，所以這裡自己建立
+        try:
+            import opencc
+            _KEY_CONVERTER["t2s"] = opencc.OpenCC("t2s")
+        except ImportError:
+            _KEY_CONVERTER["t2s"] = None
+    conv = _KEY_CONVERTER["t2s"]
+    return conv.convert(text) if conv and text else text
+
+
+def better_title(title_hint: str, page_title: str) -> str:
+    """優先用目錄上的名稱；目錄名稱不完整時（如「第3章」），若頁面標題以它開頭且更長，改用頁面標題。"""
+    if not title_hint:
+        return page_title
+    hint, page = title_key(title_hint), title_key(page_title)
+    return page_title if page.startswith(hint) and len(page) > len(hint) else title_hint
+
+
+_HEADER_META = re.compile(r"作者[:：]|\d{4}[-/年]\d{1,2}[-/月]\d{1,2}|更新時間|更新时间|字數[:：]|字数[:：]")
+
+
 def extract_content(soup: BeautifulSoup, title: str = "", inplace: bool = False) -> str:
     if not inplace:
         soup = BeautifulSoup(str(soup), "lxml")  # 複製一份，避免動到原本的 soup
@@ -366,15 +461,21 @@ def extract_content(soup: BeautifulSoup, title: str = "", inplace: bool = False)
         p.insert_after("\n")
 
     lines = []
+    tkey = title_key(title)
     for line in best.get_text().splitlines():
         line = line.strip().replace("\xa0", "").replace("\u3000", "").strip()
-        if not line or line == title or re.fullmatch(r"[←→↑↓\-—=*·.。…\s]+", line):
+        if not line or re.fullmatch(r"[←→↑↓\-—=*·.。…\s]+", line):
             continue
         if len(line) < 60 and AD_PATTERNS.search(line):
             continue
-        # 正文開頭重複的標題（例如「書名第1章 xxx」）
-        if title and len(lines) < 3 and title in line and len(line) <= len(title) + 30:
-            continue
+        if len(lines) < 3:
+            key = title_key(line)
+            # 正文開頭重複的標題（例如「書名第1章 xxx」）；比對時忽略空白（網站常用 &nbsp; 或全形空白）
+            if tkey and tkey in key and len(key) <= len(tkey) + 30:
+                continue
+            # 正文開頭的發布日期／作者資訊（例如 69shuba 的「2025-12-10 作者： xxx」）
+            if len(line) < 40 and _HEADER_META.search(line):
+                continue
         lines.append(line)
     return "\n".join(lines)
 
@@ -412,11 +513,7 @@ def fetch_chapter(driver, url: str, title_hint: str = "") -> tuple[str, str, Bea
         return len(extract_content(s)) >= MIN_CONTENT_LEN
 
     soup = load_soup(driver, url, ready)
-    page_title = extract_title(soup)
-    title = title_hint or page_title
-    # 目錄名稱不完整時（如「第3章」），若頁面標題以它開頭且更長，改用頁面標題
-    if title_hint and page_title.startswith(title_hint) and len(page_title) > len(title_hint):
-        title = page_title
+    title = better_title(title_hint, extract_title(soup))
     parts = [extract_content(soup, title)]
 
     seen = {url}
@@ -484,35 +581,31 @@ def to_traditional(text: str) -> str:
     return text.translate(QUOTE_MAP)
 
 
-def write_chapter(f, title: str, content: str) -> None:
-    title, content = to_traditional(title), to_traditional(content)
-    f.write(f"{title}\n\n{content}\n\n")
-    f.flush()  # 每章即時寫入，中斷也不會遺失已下載內容
-
-
 # ---------------------------------------------------------------------------
-# 章節暫存：每下載完一章就存起來，中斷後重新執行會自動略過已下載的章節
+# 章節暫存：每下載完一批章節就存起來，中斷後重新執行會自動略過已下載的章節
 # ---------------------------------------------------------------------------
-def cache_path(output: str) -> str:
-    folder = os.path.dirname(os.path.abspath(output))
-    stem = os.path.splitext(os.path.basename(output))[0]
-    return os.path.join(folder, CACHE_DIRNAME, stem + ".jsonl")
+def cache_path(base: str) -> str:
+    """base 為不含副檔名的輸出路徑（例如 downloads/術師手冊_黃金屋）。"""
+    folder = os.path.dirname(os.path.abspath(base))
+    return os.path.join(folder, CACHE_DIRNAME, os.path.basename(base) + ".jsonl")
 
 
 class ChapterCache:
-    """JSON Lines 格式，一行一章 {"url", "title", "content"}，以章節網址為鍵（同網址以最後一筆為準）。
-    存的是未經簡轉繁的原始內容，組合成 txt 時才轉換。"""
+    """JSON Lines 格式，一行一章 {"url", "title", "content", ...}，以章節網址為鍵（同網址以最後一筆為準）。
+    其他欄位：page_title（章節頁上的標題，品質檢查用）、next（next 模式的下一章網址）。
+    存的是未經簡轉繁的原始內容，輸出時才轉換。"""
 
     def __init__(self, path: str):
         self.path = path
-        self.data: dict[str, tuple[str, str]] = {}
+        self.data: dict[str, dict] = {}
         self._f = None
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 for line in f:
                     try:
                         rec = json.loads(line)
-                        self.data[rec["url"]] = (rec["title"], rec["content"])
+                        if isinstance(rec["title"], str) and isinstance(rec["content"], str):
+                            self.data[rec["url"]] = rec
                     except (json.JSONDecodeError, KeyError, TypeError):
                         continue  # 中斷時寫到一半的最後一行
 
@@ -523,10 +616,15 @@ class ChapterCache:
         return len(self.data)
 
     def get(self, url: str) -> tuple[str, str]:
-        return self.data[url]
+        rec = self.data[url]
+        return rec["title"], rec["content"]
 
-    def put(self, url: str, title: str, content: str) -> None:
-        self.data[url] = (title, content)
+    def meta(self, url: str) -> dict:
+        return self.data.get(url, {})
+
+    def put(self, url: str, title: str, content: str, **extra) -> None:
+        rec = {"url": url, "title": title, "content": content, **extra}
+        self.data[url] = rec
         if self._f is None:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             broken_tail = False
@@ -537,7 +635,7 @@ class ChapterCache:
             self._f = open(self.path, "a", encoding="utf-8")
             if broken_tail:  # 上次中斷在一行中間，先換行，避免新資料黏在壞掉的那行後面
                 self._f.write("\n")
-        self._f.write(json.dumps({"url": url, "title": title, "content": content}, ensure_ascii=False) + "\n")
+        self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         self._f.flush()
 
     def close(self) -> None:
@@ -546,20 +644,128 @@ class ChapterCache:
             self._f = None
 
 
-def write_book(output: str, chapters, cache: ChapterCache) -> tuple[int, int, list[int]]:
-    """依目錄順序，把暫存中所有已下載的章節組合成 txt（整本，不只這次下載的範圍）。
-    回傳 (寫入章數, 字數, 缺少的章節編號[從 1 起算])。"""
-    written, chars, missing = 0, 0, []
-    with open(output, "w", encoding="utf-8") as f:
-        for n, (_, url) in enumerate(chapters, 1):
-            if url not in cache:
-                missing.append(n)
-                continue
+# ---------------------------------------------------------------------------
+# 輸出：txt / EPUB（都由暫存產生，包含整本已下載的章節，不只這次下載的範圍）
+# ---------------------------------------------------------------------------
+FORMATS = {"txt": ["txt"], "epub": ["epub"], "both": ["txt", "epub"]}
+
+
+def collect_book(chapters, cache: ChapterCache) -> tuple[list[tuple[str, str]], list[int]]:
+    """依目錄順序取出暫存中的章節並簡轉繁。回傳 ([(標題, 正文)], 缺少的章節編號[從 1 起算])。"""
+    items, missing = [], []
+    for n, (_, url) in enumerate(chapters, 1):
+        if url in cache:
             title, content = cache.get(url)
-            write_chapter(f, title, content)
-            written += 1
-            chars += len(content)
-    return written, chars, missing
+            items.append((to_traditional(title), to_traditional(content)))
+        else:
+            missing.append(n)
+    return items, missing
+
+
+def write_txt(path: str, items: list[tuple[str, str]]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for title, content in items:
+            f.write(f"{title}\n\n{content}\n\n")
+
+
+def write_book(output: str, chapters, cache: ChapterCache) -> tuple[int, int, list[int]]:
+    """把暫存中所有已下載的章節組合成 txt。回傳 (寫入章數, 字數, 缺少的章節編號)。"""
+    items, missing = collect_book(chapters, cache)
+    write_txt(output, items)
+    return len(items), sum(len(c) for _, c in items), missing
+
+
+_EPUB_CSS = """body { font-family: serif; line-height: 1.8; }
+h2 { font-size: 1.3em; margin: 1em 0; }
+p { text-indent: 2em; margin: 0 0 0.6em 0; }
+"""
+
+
+def _xhtml(title: str, body: str) -> str:
+    return ('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n'
+            '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" '
+            'xml:lang="zh-Hant" lang="zh-Hant">\n'
+            f'<head><meta charset="utf-8"/><title>{html_lib.escape(title)}</title>'
+            f'<link rel="stylesheet" type="text/css" href="style.css"/></head>\n<body>\n{body}\n</body>\n</html>\n')
+
+
+def _xml_text(text: str) -> str:
+    # 移除 XML 不允許的控制字元，再跳脫 & < > "
+    return html_lib.escape(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text))
+
+
+def write_epub(path: str, items: list[tuple[str, str]], book: str, author: str = "", source: str = "") -> None:
+    """輸出 EPUB 3（附 EPUB 2 的 toc.ncx，舊閱讀器也能看到目錄），每章一個 XHTML 檔。"""
+    book_id = f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, source or book)}"
+    modified = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    names = [f"c{n:05d}.xhtml" for n in range(1, len(items) + 1)]
+
+    manifest = "".join(f'<item id="c{n}" href="{name}" media-type="application/xhtml+xml"/>\n'
+                       for n, name in enumerate(names, 1))
+    spine = "".join(f'<itemref idref="c{n}"/>\n' for n in range(1, len(items) + 1))
+    opf = f"""<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="zh-Hant">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="bookid">{book_id}</dc:identifier>
+<dc:title>{_xml_text(book)}</dc:title>
+<dc:creator>{_xml_text(author or "未知")}</dc:creator>
+<dc:language>zh-Hant</dc:language>
+<dc:source>{_xml_text(source)}</dc:source>
+<meta property="dcterms:modified">{modified}</meta>
+</metadata>
+<manifest>
+<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+<item id="css" href="style.css" media-type="text/css"/>
+{manifest}</manifest>
+<spine toc="ncx">
+{spine}</spine>
+</package>
+"""
+    nav_items = "".join(f'<li><a href="{name}">{_xml_text(t)}</a></li>\n' for name, (t, _) in zip(names, items))
+    nav = _xhtml(book, f'<nav epub:type="toc" id="toc"><h1>{_xml_text(book)}</h1>\n<ol>\n{nav_items}</ol></nav>')
+    points = "".join(f'<navPoint id="p{n}" playOrder="{n}"><navLabel><text>{_xml_text(t)}</text></navLabel>'
+                     f'<content src="{name}"/></navPoint>\n'
+                     for n, (name, (t, _)) in enumerate(zip(names, items), 1))
+    ncx = f"""<?xml version="1.0" encoding="utf-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<head><meta name="dtb:uid" content="{book_id}"/></head>
+<docTitle><text>{_xml_text(book)}</text></docTitle>
+<navMap>
+{points}</navMap>
+</ncx>
+"""
+    container = """<?xml version="1.0" encoding="utf-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>
+"""
+    with zipfile.ZipFile(path, "w") as z:
+        # mimetype 必須是第一個檔案且不壓縮
+        z.writestr(zipfile.ZipInfo("mimetype"), "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr("META-INF/container.xml", container, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/content.opf", opf, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/nav.xhtml", nav, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/toc.ncx", ncx, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/style.css", _EPUB_CSS, compress_type=zipfile.ZIP_DEFLATED)
+        for name, (title, content) in zip(names, items):
+            paras = "\n".join(f"<p>{_xml_text(line)}</p>" for line in content.splitlines() if line.strip())
+            z.writestr(f"OEBPS/{name}", _xhtml(title, f"<h2>{_xml_text(title)}</h2>\n{paras}"),
+                       compress_type=zipfile.ZIP_DEFLATED)
+
+
+def export_book(base: str, fmt: str, chapters, cache: ChapterCache, meta: dict) -> tuple[list[str], int, int, list[int]]:
+    """依 --format 輸出檔案。回傳 (輸出的檔案路徑, 章數, 字數, 缺少的章節編號)。"""
+    items, missing = collect_book(chapters, cache)
+    paths = []
+    for ext in FORMATS[fmt]:
+        path = f"{base}.{ext}"
+        if ext == "txt":
+            write_txt(path, items)
+        else:
+            write_epub(path, items, meta.get("book", ""), meta.get("author", ""), meta.get("source", ""))
+        paths.append(path)
+    return paths, len(items), sum(len(c) for _, c in items), missing
 
 
 def _ranges(nums: list[int]) -> str:
@@ -574,15 +780,53 @@ def _ranges(nums: list[int]) -> str:
     return ", ".join(out)
 
 
+# ---------------------------------------------------------------------------
+# 品質檢查
+# ---------------------------------------------------------------------------
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "兩": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNITS = {"十": 10, "百": 100, "千": 1000, "萬": 10000, "万": 10000}
+_CHAPTER_NUM = re.compile(r"第\s*([0-9０-９]+|[零〇一二兩两三四五六七八九十百千萬万]+)\s*[章回節节話话]")
+
+
+def _cn_to_int(text: str) -> int:
+    """中文數字轉整數：一百二十三 → 123、十五 → 15、一二三 → 123。"""
+    if all(ch in _CN_DIGITS for ch in text):  # 一二三 這種逐位寫法
+        return int("".join(str(_CN_DIGITS[ch]) for ch in text))
+    total, section, num = 0, 0, 0
+    for ch in text:
+        if ch in _CN_DIGITS:
+            num = _CN_DIGITS[ch]
+        elif ch in _CN_UNITS:
+            unit = _CN_UNITS[ch]
+            if unit == 10000:
+                total += (section + num) * unit
+                section = 0
+            else:
+                section += (num or 1) * unit
+            num = 0
+    return total + section + num
+
+
+def chapter_number(title: str) -> int | None:
+    """從「第123章」「第一百二十三章」取出章節編號，沒有則回傳 None。"""
+    m = _CHAPTER_NUM.search(title or "")
+    if not m:
+        return None
+    s = m.group(1)
+    return int(s) if s[0] in "0123456789０１２３４５６７８９" else _cn_to_int(s)
+
+
 def check_quality(chapters, cache: ChapterCache) -> list[str]:
-    """檢查已下載章節中可疑的地方：字數過少/過多、和其他章內容重複。回傳警告訊息。"""
-    items = [(n, *cache.get(url)) for n, (_, url) in enumerate(chapters, 1) if url in cache]
+    """檢查已下載章節中可疑的地方：字數過少/過多、和其他章內容重複、章節頁標題的章號和目錄不同。"""
+    items = [(n, chapters[n - 1][0], *cache.get(url), cache.meta(url).get("page_title", ""))
+             for n, (_, url) in enumerate(chapters, 1) if url in cache]
     if len(items) < 3:
         return []
-    median = statistics.median(len(c) for _, _, c in items)
+    median = statistics.median(len(c) for _, _, _, c, _ in items)
     warnings = []
     seen: dict[str, int] = {}
-    for n, title, content in items:
+    for n, toc_title, title, content, page_title in items:
         size = len(content)
         if size < max(MIN_CONTENT_LEN, median * 0.3):
             warnings.append(f"第 {n} 章「{title}」只有 {size} 字（一般約 {median:.0f} 字）")
@@ -594,6 +838,9 @@ def check_quality(chapters, cache: ChapterCache) -> list[str]:
                 warnings.append(f"第 {n} 章「{title}」開頭與第 {seen[key]} 章相同，可能重複或抓錯頁面")
             else:
                 seen[key] = n
+        a, b = chapter_number(toc_title), chapter_number(page_title)
+        if a is not None and b is not None and a != b:
+            warnings.append(f"第 {n} 章：目錄是「{toc_title}」，但頁面標題是「{page_title}」，連結可能指到別章")
     return warnings
 
 
@@ -602,9 +849,9 @@ def download_by_toc(driver, chapters, indices, cache: ChapterCache, delay) -> No
     total = len(chapters)
     for i in indices:
         title, url = chapters[i]
-        title, content, _ = fetch_chapter(driver, url, title)
+        title, content, soup = fetch_chapter(driver, url, title)
         if content:
-            cache.put(url, title, content)
+            cache.put(url, title, content, page_title=extract_title(soup))
         else:
             print(f"  ⚠ 第 {i + 1} 章未擷取到正文：{url}")
         print(f"[{i + 1}/{total}] {title}（{len(content)} 字）")
@@ -615,9 +862,14 @@ def download_by_toc(driver, chapters, indices, cache: ChapterCache, delay) -> No
 # 快速模式：在瀏覽器內用 fetch() 平行下載原始 HTML，再用多進程解析
 # （沿用瀏覽器的連線、憑證與 Cookie，所以 Cloudflare / 憑證問題都跟瀏覽器一樣能過）
 # ---------------------------------------------------------------------------
-_FETCH_JS = r"""
-const urls = arguments[0], limit = arguments[1], rate = arguments[2], done = arguments[arguments.length - 1];
-const out = new Array(urls.length).fill(null);
+# 啟動一批下載後立刻回傳 job id，不等下載完成；Python 再用 _POLL_JS 每 0.3 秒查一次。
+# 不用 execute_async_script 等整批完成，是因為 chromedriver 一次只處理一個指令：
+# 長時間的指令會讓 Ctrl+C 後的 driver.quit() 卡住，也受 Selenium 120 秒逾時限制。
+_FETCH_START_JS = r"""
+const urls = arguments[0], limit = arguments[1], rate = arguments[2];
+const job = {out: new Array(urls.length).fill(null), done: false, finished: 0};
+const id = 'nd' + Date.now() + '_' + Math.random().toString(36).slice(2);
+(window.__ndJobs = window.__ndJobs || {})[id] = job;
 let next = 0;
 // 限速：rate > 0 時，每個請求的「開始時間」至少間隔 1000/rate 毫秒
 const gap = rate > 0 ? 1000 / rate : 0;
@@ -639,11 +891,11 @@ async function getOne(u) {
   for (let t = 0; t < 3; t++) {
     try {
       await throttle();
-      const r = await fetch(u, {credentials: 'include', headers: {
+      const r = await fetch(u, {credentials: 'include', signal: AbortSignal.timeout(30000), headers: {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}});
       const html = decode(await r.arrayBuffer(), r.headers.get('content-type'));
       // 人機驗證 / 封鎖 → 交給 Python 請使用者驗證；限流（429/503）→ 交給 Python 降速重試
-      if (r.status === 403 || /challenge-platform|cf-chl|cf_chl/.test(html)) return '__CHALLENGE__';
+      if (r.status === 403 || /challenge-platform|cf-chl|cf_chl|<title>\s*(正在验证浏览器|正在驗證瀏覽器)/.test(html)) return '__CHALLENGE__';
       if (r.status === 429 || r.status === 503) return '__RATELIMIT__';
       if (!r.ok) throw new Error(r.status);
       // 先砍掉 script/style，減少回傳給 Python 的資料量
@@ -652,8 +904,19 @@ async function getOne(u) {
   }
   return null;
 }
-async function worker() { while (next < urls.length) { const i = next++; out[i] = await getOne(urls[i]); } }
-Promise.all(Array.from({length: limit}, worker)).then(() => done(out));
+async function worker() {
+  while (next < urls.length) { const i = next++; job.out[i] = await getOne(urls[i]); job.finished++; }
+}
+Promise.all(Array.from({length: limit}, worker)).then(() => { job.done = true; });
+return id;
+"""
+
+_POLL_JS = r"""
+const jobs = window.__ndJobs || {}, job = jobs[arguments[0]];
+if (!job) return {lost: true};
+if (!job.done) return {done: false};
+delete jobs[arguments[0]];
+return {done: true, out: job.out};
 """
 
 
@@ -666,12 +929,16 @@ RATE_MIN = 0.5
 RATE_MAX = 50.0
 RATE_DOWN = 0.6        # 被限流時乘上此值
 RATE_UP = 1.25         # 一段時間沒被擋時乘上此值
+RATE_SAFETY = 0.85     # 記錄網站速度時打的折扣（學到的是「剛好沒被擋」的速度，留一點餘裕）
 RATELIMIT_WAIT = 3     # 被限流後等待秒數
+POLL_INTERVAL = 0.3    # 快速模式每隔幾秒檢查一次瀏覽器是否抓完
 
 
 def is_challenge_page(html: str) -> bool:
     # 只看 Cloudflare 的技術特徵，避免小說內文剛好出現「驗證」等字眼而誤判
-    return bool(re.search(r"challenge-platform|cf-chl|cf_chl|<title>Just a moment", html))
+    # 也比對自訂驗證頁的 <title>（ttkan 的「正在验证浏览器」）：只看 <title>，不會被正文誤判
+    return bool(re.search(r"challenge-platform|cf-chl|cf_chl|<title>Just a moment"
+                          r"|<title>\s*(正在验证浏览器|正在驗證瀏覽器)", html))
 
 
 class BlockedError(RuntimeError):
@@ -709,14 +976,17 @@ def wait_for_human(driver, url: str, timeout: int = 600) -> None:
 
 
 def fetch_many(driver, urls: list[str], concurrency: int, rate: float = 0) -> list[str | None]:
+    """在瀏覽器內平行下載 urls，回傳 HTML（失敗為 None；被擋為 CHALLENGE / RATELIMIT）。"""
     if not urls:
         return []
-    # Selenium 單一指令有 120 秒逾時：限速時把網址切成每段約 60 秒能抓完的量
-    chunk = max(1, int(rate * 60)) if rate > 0 else len(urls)
-    results: list[str | None] = []
-    for k in range(0, len(urls), chunk):
-        results += driver.execute_async_script(_FETCH_JS, urls[k:k + chunk], concurrency, rate)
-    return results
+    job = driver.execute_script(_FETCH_START_JS, urls, concurrency, rate)
+    while True:
+        time.sleep(POLL_INTERVAL)  # 等待期間按 Ctrl+C 會立刻生效
+        r = driver.execute_script(_POLL_JS, job)
+        if r.get("lost"):  # 頁面被切換（例如使用者在視窗中點了連結），這批全部當成失敗
+            return [None] * len(urls)
+        if r.get("done"):
+            return r["out"]
 
 
 def fetch_many_with_verify(driver, urls: list[str], state: dict) -> list[str | None]:
@@ -742,8 +1012,8 @@ def fetch_many_with_verify(driver, urls: list[str], state: dict) -> list[str | N
                 results[k] = h
         todo = challenged + limited + todo  # 被擋的頁面優先重抓
 
-        if (challenged or limited) and rate > 0:
-            state.setdefault("limited", []).append(rate)
+        if challenged or limited:  # 不限速時被擋記為無限大，代表「網站有上限」
+            state.setdefault("limited", []).append(rate if rate > 0 else float("inf"))
         elif not challenged and not limited and rate > 0:
             state.setdefault("ok", []).append(rate)
 
@@ -767,8 +1037,10 @@ def fetch_many_with_verify(driver, urls: list[str], state: dict) -> list[str | N
 
 def learned_rate(state: dict) -> float | None:
     """這次下載中「沒被擋過的最快速度」：低於任何曾被擋的速度、且整段順利的最高速度。
-    從頭到尾都不限速也沒被擋 → None（不需要記錄）。"""
-    limit = min(state.get("limited", []), default=float("inf"))
+    這次完全沒被擋過 → None：順利的速度只是我們試過的速度，不代表網站上限，不能拿來覆蓋記錄。"""
+    if not state.get("limited"):
+        return None
+    limit = min(state["limited"])
     ok = [r for r in state.get("ok", []) if r < limit]
     return max(ok) if ok else None
 
@@ -792,27 +1064,60 @@ def save_site_rate(host: str, rate: float) -> None:
         print(f"  ⚠ 無法儲存網站速度記錄：{e}")
 
 
-def parse_chapter_html(html: str, url: str, title_hint: str) -> tuple[str, str, str | None]:
-    """（給子進程用）解析一頁 HTML，回傳 (標題, 正文, 下一分頁網址)。"""
+def parse_chapter_html(html: str, url: str, title_hint: str) -> tuple[str, str, str | None, str]:
+    """（給子進程用）解析一頁 HTML，回傳 (標題, 正文, 下一分頁網址, 章節頁上的標題)。"""
     soup = BeautifulSoup(html, "lxml")
     page_title = extract_title(soup)
-    title = title_hint or page_title
-    if title_hint and page_title.startswith(title_hint) and len(page_title) > len(title_hint):
-        title = page_title
+    title = better_title(title_hint, page_title)
     continuation = find_continuation(soup, url)
-    return title, extract_content(soup, title, inplace=True), continuation
+    return title, extract_content(soup, title, inplace=True), continuation, page_title
+
+
+def _worker_init() -> None:
+    # 解析用的子進程忽略 Ctrl+C，交給主程式處理，避免每個子進程都印出一大串錯誤訊息
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def _warmup(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def start_parser_pool():
+    """建立解析用的進程池，並在「暫時忽略 Ctrl+C」的狀態下把所有子進程都先啟動。
+    子進程會繼承忽略 Ctrl+C 的設定；否則在子進程啟動中（匯入模組時）按 Ctrl+C，
+    _worker_init 還來不及執行，每個子進程都會印出一大串錯誤訊息。"""
+    from concurrent.futures import ProcessPoolExecutor
+
+    workers = min(os.cpu_count() or 2, 61)  # Windows 上限 61
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, True)  # 會被子進程繼承
+    else:
+        old = signal.signal(signal.SIGINT, signal.SIG_IGN)       # SIG_IGN 會被子進程繼承
+    try:
+        pool = ProcessPoolExecutor(max_workers=workers, initializer=_worker_init)
+        list(pool.map(_warmup, [0.2] * workers))  # 同時送出多個工作，逼它一次啟動所有子進程
+    finally:
+        if os.name == "nt":
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
+        else:
+            signal.signal(signal.SIGINT, old)
+    return pool
 
 
 def download_fast(driver, chapters, indices, cache: ChapterCache, state: dict, batch_size: int) -> None:
-    """快速模式：每批 batch_size 章抓完（含一章多頁、退回瀏覽器重抓）就存進暫存，中斷時最多只損失一批。"""
-    from concurrent.futures import ProcessPoolExecutor
-
+    """快速模式：每批章節抓完（含一章多頁、退回瀏覽器重抓）就存進暫存，中斷時最多只損失一批。
+    限速時每批約 20 秒的量（最少 5 章、最多 batch_size 章），慢速網站中斷時也不會損失太多。"""
     t0 = time.time()
-    done = 0
-    with ProcessPoolExecutor() as pool:
-        for b in range(0, len(indices), batch_size):
-            batch = indices[b:b + batch_size]
+    pos = 0
+    with start_parser_pool() as pool:
+        while pos < len(indices):
+            rate = state["rate"]
+            size = batch_size if rate <= 0 else max(5, min(batch_size, int(rate * 20)))
+            batch = indices[pos:pos + size]
+            pos += len(batch)
             titles = {i: chapters[i][0] for i in batch}
+            page_titles: dict[int, str] = {}
             parts: dict[int, list[str]] = {i: [] for i in batch}
             failed: set[int] = set()
             pending = [(i, chapters[i][1]) for i in batch]  # (章節索引, 要抓的網址)
@@ -827,8 +1132,9 @@ def download_fast(driver, chapters, indices, cache: ChapterCache, state: dict, b
                         futures.append((i, pool.submit(parse_chapter_html, html, u, titles[i])))
                 pending = []
                 for i, fut in futures:
-                    title, content, cont = fut.result()
+                    title, content, cont, page_title = fut.result()
                     titles[i] = title
+                    page_titles.setdefault(i, page_title)
                     parts[i].append(content)
                     if cont and cont not in seen:
                         seen.add(cont)
@@ -840,67 +1146,61 @@ def download_fast(driver, chapters, indices, cache: ChapterCache, state: dict, b
                 # 原始 HTML 抓不到正文（可能是 JS 動態產生）→ 退回用瀏覽器開啟
                 if i in failed or len(content) < MIN_CONTENT_LEN:
                     try:
-                        titles[i], content, _ = fetch_chapter(driver, url, chapters[i][0])
+                        titles[i], content, soup = fetch_chapter(driver, url, chapters[i][0])
+                        page_titles[i] = extract_title(soup)
                     except BlockedError:
                         raise
                     except RuntimeError as e:
                         print(f"  ⚠ 第 {i + 1} 章：{e}")
                         continue
                 if content:
-                    cache.put(url, titles[i], content)
+                    cache.put(url, titles[i], content, page_title=page_titles.get(i, ""))
                 else:
                     print(f"  ⚠ 第 {i + 1} 章未擷取到正文：{url}")
-            done += len(batch)
-            print(f"  已下載 {done}/{len(indices)} 章（{time.time() - t0:.1f}s）")
+            print(f"  已下載 {pos}/{len(indices)} 章（{time.time() - t0:.1f}s）")
 
 
-def download_by_next(driver, url, output, max_pages, append, delay) -> None:
-    pattern = url_pattern(url)
-    with open(output, "a" if append else "w", encoding="utf-8") as f:
-        for i in range(max_pages):
-            try:
-                title, content, soup = fetch_chapter(driver, url)
-            except RuntimeError as e:
-                print(f"{e}\n可用 --mode next --append {url} 從此處接續。")
-                return
-            write_chapter(f, title, content)
-            print(f"[{i + 1}] {title}（{len(content)} 字）")
+def download_by_next(driver, start_url, cache: ChapterCache, chain: list, max_pages: int,
+                     delay: float, refresh: bool = False) -> None:
+    """next 模式：一路跟隨「下一章」。抓到的章節依序加進 chain（呼叫端用來輸出）。
+    暫存中有記錄下一章網址的章節直接沿用，不重新下載；最後一章（沒有下一章）會重新抓，以便發現新章節。"""
+    pattern = url_pattern(start_url)
+    url, reused = start_url, 0
+    while url and len(chain) < max_pages:
+        rec = cache.meta(url) if not refresh else {}
+        if rec.get("next"):
+            chain.append((rec["title"], url))
+            reused += 1
+            url = rec["next"]
+            continue
+        if reused:
+            print(f"已有 {reused} 章下載過，自動略過；要重新下載請加 --refresh")
+            reused = 0
+        title, content, soup = fetch_chapter(driver, url)
+        nxt = find_link(soup, url, NEXT_CHAPTER_TEXT)
+        # 下一章連回目錄或格式不同的頁面，代表已到最後一章
+        if not nxt or nxt == url or url_pattern(nxt) != pattern:
+            nxt = None
+        if content:
+            cache.put(url, title, content, page_title=extract_title(soup), next=nxt)
+        else:
+            print(f"  ⚠ 未擷取到正文：{url}")
+        chain.append((title, url))
+        print(f"[{len(chain)}] {title}（{len(content)} 字）")
+        if not nxt:
+            print("已到最後一章。")
+            return
+        url = nxt
+        time.sleep(delay)
 
-            nxt = find_link(soup, url, NEXT_CHAPTER_TEXT)
-            # 下一章連回目錄或格式不同的頁面，代表已到最後一章
-            if not nxt or nxt == url or url_pattern(nxt) != pattern:
-                print("已到最後一章。")
-                return
-            url = nxt
-            time.sleep(delay)
 
-
-def download_toc_book(driver, args, chapters, output) -> None:
-    """有目錄時的下載流程：略過暫存中已有的章節 → 下載 → 組合成 txt → 檢查品質 → 記錄網站速度。"""
-    total = len(chapters)
-    lo, hi = max(args.start, 1) - 1, min(args.end or total, total)
-    cache = ChapterCache(cache_path(output))
-    if lo > 0 and not len(cache) and os.path.exists(output):
-        # 舊版（沒有暫存）下載的檔案：--start 只會下載後半段，直接覆寫會遺失前面的章節
-        stem, ext = os.path.splitext(output)
-        backup = f"{stem}.bak{ext}"
-        os.replace(output, backup)
-        print(f"⚠ 沒有找到「{output}」的下載暫存，原檔已備份為「{backup}」，新檔只會包含這次下載的章節。")
-    indices =[i for i in range(lo, hi) if args.refresh or chapters[i][1] not in cache]
-    skipped = (hi - lo) - len(indices)
-    if skipped:
-        print(f"已有 {skipped} 章下載過（暫存：{cache.path}），自動略過；要重新下載請加 --refresh")
-
-    host = urlparse(args.url).netloc
+def run_and_export(args, base: str, meta: dict, cache: ChapterCache, chapters: list, job) -> None:
+    """執行下載工作 job()，不論成功或中斷都把暫存輸出成檔案，再記錄網站速度、檢查品質。
+    chapters 為輸出順序 [(標題, 網址)]（next 模式由 job 邊下載邊加入）。"""
     t0 = time.time()
     completed = False
     try:
-        if not indices:
-            print("指定範圍的章節都已下載過。")
-        elif args.slow:
-            download_by_toc(driver, chapters, indices, cache, args.delay)
-        else:
-            download_fast(driver, chapters, indices, cache, args.state, args.batch_size)
+        job()
         completed = True
     except KeyboardInterrupt:
         print("\n使用者中斷。已下載的章節都已保存，重新執行同一指令即可接續。")
@@ -910,13 +1210,15 @@ def download_toc_book(driver, args, chapters, output) -> None:
         print(f"\n✗ {e}\n已下載的章節都已保存，重新執行同一指令即可接續。")
     finally:
         cache.close()
-        written, chars, missing = write_book(output, chapters, cache)
-        print(f"{'完成' if completed else '已輸出目前進度'}：共 {written} 章、{chars:,} 字，"
-              f"耗時 {time.time() - t0:.1f} 秒 → {output}")
+        paths, count, chars, missing = export_book(base, args.format, chapters, cache, meta)
+        print(f"{'完成' if completed else '已輸出目前進度'}：共 {count} 章、{chars:,} 字，"
+              f"耗時 {time.time() - t0:.1f} 秒 → {'、'.join(paths)}")
         if missing:
             print(f"  尚未下載的章節（{len(missing)} 章）：{_ranges(missing)}")
         rate = learned_rate(args.state)
         if rate:
+            rate *= RATE_SAFETY
+            host = urlparse(args.url).netloc
             save_site_rate(host, rate)
             print(f"  已記錄 {host} 的穩定速度：每秒 {rate:.1f} 頁（下次直接從這個速度開始）")
 
@@ -930,10 +1232,61 @@ def download_toc_book(driver, args, chapters, output) -> None:
         print("  要重新下載某幾章：--start N --end M --refresh")
 
 
+def download_toc_book(driver, args, chapters, base: str, meta: dict) -> None:
+    """有目錄時：略過暫存中已有的章節 → 下載 → 輸出 → 檢查品質。"""
+    total = len(chapters)
+    lo, hi = max(args.start, 1) - 1, min(args.end or total, total)
+    cache = ChapterCache(cache_path(base))
+    txt = base + ".txt"
+    if lo > 0 and not len(cache) and os.path.exists(txt):
+        # 舊版（沒有暫存）下載的檔案：--start 只會下載後半段，直接覆寫會遺失前面的章節
+        backup = base + ".bak.txt"
+        os.replace(txt, backup)
+        print(f"⚠ 沒有找到「{txt}」的下載暫存，原檔已備份為「{backup}」，新檔只會包含這次下載的章節。")
+    indices = [i for i in range(lo, hi) if args.refresh or chapters[i][1] not in cache]
+    skipped = (hi - lo) - len(indices)
+    if skipped:
+        print(f"已有 {skipped} 章下載過（暫存：{cache.path}），自動略過；要重新下載請加 --refresh")
+
+    def job():
+        if not indices:
+            print("指定範圍的章節都已下載過。")
+        elif args.slow:
+            download_by_toc(driver, chapters, indices, cache, args.delay)
+        else:
+            download_fast(driver, chapters, indices, cache, args.state, args.batch_size)
+
+    run_and_export(args, base, meta, cache, chapters, job)
+
+
+def download_next_book(driver, args, base: str, meta: dict) -> None:
+    """沒有目錄時：從起始章節一路抓「下一章」，同樣使用暫存，可中斷續傳。"""
+    cache = ChapterCache(cache_path(base))
+    chain: list[tuple[str, str]] = []
+    run_and_export(args, base, meta, cache, chain,
+                   lambda: download_by_next(driver, args.url, cache, chain, args.max_pages,
+                                            args.delay, args.refresh))
+
+
+def output_base(args, book: str, site: str) -> str:
+    """輸出路徑（不含副檔名）。-o 有給 .txt / .epub 副檔名時去掉；沒給 -o 時放在 downloads/。"""
+    if args.output:
+        root, ext = os.path.splitext(args.output)
+        base = root if ext.lower() in (".txt", ".epub") else args.output
+    else:
+        base = os.path.join(DOWNLOAD_DIR, safe_filename(f"{book}_{site}"))
+    folder = os.path.dirname(os.path.abspath(base))
+    os.makedirs(folder, exist_ok=True)
+    return base
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="通用小說下載器")
     parser.add_argument("url", help="目錄頁網址（或 --mode next 時的起始章節網址）")
-    parser.add_argument("-o", "--output", help="輸出檔名（預設為「書名_網站名.txt」）")
+    parser.add_argument("-o", "--output",
+                        help="輸出檔名（預設為 downloads/書名_網站名；副檔名依 --format 自動加上）")
+    parser.add_argument("-f", "--format", choices=list(FORMATS), default="txt",
+                        help="輸出格式：txt（預設）、epub、both（兩種都輸出）")
     parser.add_argument("--mode", choices=["auto", "toc", "next"], default="auto",
                         help="auto：自動判斷；toc：解析目錄；next：一路點下一章")
     parser.add_argument("--start", type=int, default=1, help="從第幾章開始下載")
@@ -943,12 +1296,11 @@ def main() -> None:
     parser.add_argument("--reverse", action="store_true", help="目錄為新→舊排列時使用")
     parser.add_argument("--list", action="store_true", help="只列出章節清單，不下載")
     parser.add_argument("--max-pages", type=int, default=100000, help="next 模式最多抓幾章")
-    parser.add_argument("--append", action="store_true", help="next 模式附加到既有檔案")
     parser.add_argument("--delay", type=float, default=0.5, help="慢速/next 模式每章間隔秒數")
     parser.add_argument("--slow", action="store_true", help="改用瀏覽器逐章開啟（JS 動態網站用）")
     parser.add_argument("-c", "--concurrency", type=int, default=8, help="快速模式同時下載數（太高會觸發網站人機驗證）")
     parser.add_argument("--batch-size", type=int, default=50,
-                        help="快速模式每批幾章（每批完成就存進暫存，中斷時最多損失一批）")
+                        help="快速模式每批最多幾章（每批完成就存進暫存，中斷時最多損失一批）")
     parser.add_argument("-r", "--rate", type=float, default=None,
                         help="快速模式起始速度，每秒幾頁（0 = 不限；預設沿用上次記錄的速度，沒有記錄則不限）")
     parser.add_argument("--profile", default=CHROME_PROFILE,
@@ -969,12 +1321,13 @@ def main() -> None:
     if not args.headless and not args.show:
         driver.minimize_window()
         WINDOW["minimized"] = True
-    driver.set_script_timeout(600)
     try:
         soup = load_soup(driver, args.url)
         book = to_traditional(extract_book_name(soup))
         site = to_traditional(extract_site_name(soup, args.url))
-        output = args.output or safe_filename(f"{book}_{site}") + ".txt"
+        meta = {"book": book, "author": to_traditional(extract_author(soup)), "source": args.url}
+        base = output_base(args, book, site)
+        outputs = "、".join(f"{base}.{ext}" for ext in FORMATS[args.format])
 
         # 起始速度：命令列指定 > 上次記錄的速度 > 不限
         host = urlparse(args.url).netloc
@@ -996,15 +1349,15 @@ def main() -> None:
             chapters.reverse()
 
         if args.mode == "toc" or len(chapters) >= MIN_TOC_LINKS:
-            print(f"書名：{book}，共 {len(chapters)} 章 → {output}")
+            print(f"書名：{book}，共 {len(chapters)} 章 → {outputs}")
             if args.list:
                 for i, (title, url) in enumerate(chapters, 1):
                     print(f"{i:>5}. {title}  {url}")
                 return
-            download_toc_book(driver, args, chapters, output)
+            download_toc_book(driver, args, chapters, base, meta)
         else:
-            print(f"未偵測到目錄，改用「下一章」模式 → {output}")
-            download_by_next(driver, args.url, output, args.max_pages, args.append, args.delay)
+            print(f"未偵測到目錄，改用「下一章」模式 → {outputs}")
+            download_next_book(driver, args, base, meta)
     except BlockedError as e:
         print(f"\n✗ {e}")
         if args.headless:

@@ -14,7 +14,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import novel_downloader as nd  # noqa: E402
+from novel import browser, config, toc  # noqa: E402
 
 FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -24,16 +24,23 @@ def main() -> None:
         print(__doc__)
         return
     url, name = sys.argv[1], sys.argv[2]
-    driver = nd.build_driver(nd.CHROME_PROFILE, False)
-    driver.minimize_window()
-    nd.WINDOW["minimized"] = True
+    lock = browser.acquire_lock(config.CHROME_PROFILE)
+    if lock is None:
+        print("✗ 下載器正在執行中（Chrome 設定檔被佔用），請等它結束後再試。")
+        return
     try:
-        nd.load_soup(driver, url)
-        nd.expand_toc(driver)
-        html = driver.page_source
-        final_url = driver.current_url
+        driver = browser.build_driver(config.CHROME_PROFILE, False)
+        driver.minimize_window()
+        browser.WINDOW["minimized"] = True
+        try:
+            browser.load_soup(driver, url)
+            toc.expand_toc(driver)
+            html = driver.page_source
+            final_url = driver.current_url
+        finally:
+            driver.quit()
     finally:
-        driver.quit()
+        browser.release_lock(lock)
     html = re.sub(r"<(script|style|noscript|svg)\b[\s\S]*?</\1>", "", html, flags=re.I)
     os.makedirs(FIXTURE_DIR, exist_ok=True)
     path = os.path.join(FIXTURE_DIR, name + ".html")

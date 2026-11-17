@@ -43,8 +43,9 @@ def chapter_number(title: str) -> int | None:
     return int(s) if s[0] in "0123456789０１２３４５６７８９" else _cn_to_int(s)
 
 
-def check_quality(chapters, cache: ChapterCache) -> list[str]:
-    """檢查已下載章節中可疑的地方：字數過少/過多、和其他章內容重複、章節頁標題的章號和目錄不同。"""
+def check_quality(chapters, cache: ChapterCache) -> list[tuple[int, str]]:
+    """檢查已下載章節中可疑的地方：字數過少/過多、和其他章內容重複、章節頁標題的章號和目錄不同。
+    回傳 [(章節編號（從 1 起算）, 說明)]，依章節順序；同一章可能有多筆。"""
     items = [(n, chapters[n - 1][0], *cache.get(url), cache.meta(url).get("page_title", ""))
              for n, (_, url) in enumerate(chapters, 1) if url in cache]
     if len(items) < 3:
@@ -55,16 +56,16 @@ def check_quality(chapters, cache: ChapterCache) -> list[str]:
     for n, toc_title, title, content, page_title in items:
         size = len(content)
         if size < max(MIN_CONTENT_LEN, median * 0.3):
-            warnings.append(f"第 {n} 章「{title}」只有 {size} 字（一般約 {median:.0f} 字）")
+            warnings.append((n, f"第 {n} 章「{title}」只有 {size} 字（一般約 {median:.0f} 字）"))
         elif size > max(median * 4, 20000):
-            warnings.append(f"第 {n} 章「{title}」有 {size} 字，遠多於一般的 {median:.0f} 字，可能混入其他內容")
+            warnings.append((n, f"第 {n} 章「{title}」有 {size} 字，遠多於一般的 {median:.0f} 字，可能混入其他內容"))
         key = re.sub(r"\s+", "", content)[:200]
         if len(key) >= 50:
             if key in seen:
-                warnings.append(f"第 {n} 章「{title}」開頭與第 {seen[key]} 章相同，可能重複或抓錯頁面")
+                warnings.append((n, f"第 {n} 章「{title}」開頭與第 {seen[key]} 章相同，可能重複或抓錯頁面"))
             else:
                 seen[key] = n
         a, b = chapter_number(toc_title), chapter_number(page_title)
         if a is not None and b is not None and a != b:
-            warnings.append(f"第 {n} 章：目錄是「{toc_title}」，但頁面標題是「{page_title}」，連結可能指到別章")
+            warnings.append((n, f"第 {n} 章：目錄是「{toc_title}」，但頁面標題是「{page_title}」，連結可能指到別章"))
     return warnings

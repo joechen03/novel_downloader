@@ -9,7 +9,7 @@ from selenium.common.exceptions import WebDriverException
 
 from .browser import BlockedError, load_soup
 from .chapter import extract_title, fetch_chapter, find_link, parse_chapter_html
-from .config import MIN_CONTENT_LEN, NEXT_CHAPTER_TEXT
+from .config import MAX_RETRY_SUSPECTS, MIN_CONTENT_LEN, NEXT_CHAPTER_TEXT
 from .exporter import _ranges, export_book
 from .fetcher import RATE_SAFETY, fetch_binary, fetch_many_with_verify, learned_rate, save_site_rate
 from .quality import check_quality
@@ -170,22 +170,58 @@ def download_by_next(driver, start_url, cache: ChapterCache, chain: list, max_pa
         time.sleep(delay)
 
 
-def run_and_export(args, base: str, meta: dict, cache: ChapterCache, chapters: list, job) -> str:
-    """執行下載工作 job()，不論成功或中斷都把暫存輸出成檔案，再記錄網站速度、檢查品質。
-    chapters 為輸出順序 [(標題, 網址)]（next 模式由 job 邊下載邊加入）。
-    回傳 "done"（完成）、"interrupted"（使用者按 Ctrl+C）或 "error"（下載失敗）。"""
-    t0 = time.time()
-    status = "error"
+def _run(job, what: str = "") -> str:
+    """執行 job()，回傳 "done" / "interrupted" / "error"；BlockedError 往上拋。"""
     try:
         job()
-        status = "done"
+        return "done"
     except KeyboardInterrupt:
-        status = "interrupted"
-        print("\n使用者中斷。已下載的章節都已保存，重新執行同一指令即可接續。")
+        print(f"\n使用者中斷{what}。已下載的章節都已保存，重新執行同一指令即可接續。")
+        return "interrupted"
     except BlockedError:
         raise
     except RuntimeError as e:
         print(f"\n✗ {e}\n已下載的章節都已保存，重新執行同一指令即可接續。")
+        return "error"
+
+
+def retry_suspects(warnings, chapters, cache: ChapterCache, retry) -> tuple[str, list[int], list[int]]:
+    """把品質檢查標出的章節重新下載一次（retry(索引清單)）。重抓過的章節在暫存中記上 retried，
+    之後不再自動重抓（例如網站本身就重複的章節，每次重抓也一樣）；--refresh 重新下載後標記會消失。
+    回傳 (狀態, 內容有變的章節編號, 內容沒變的章節編號)。"""
+    targets = sorted({n for n, _ in warnings if not cache.meta(chapters[n - 1][1]).get("retried")})
+    if not targets:
+        return "done", [], []
+    if len(targets) > MAX_RETRY_SUSPECTS:
+        print(f"\n可疑章節有 {len(targets)} 章，太多了，不自動重抓（可能是擷取規則不適用這個網站）")
+        return "done", [], []
+    print(f"\n品質檢查標出 {len(targets)} 個可疑章節，自動重新下載一次：{_ranges(targets)}")
+    before = {n: cache.get(chapters[n - 1][1]) for n in targets}
+    status = _run(lambda: retry([n - 1 for n in targets]), "重抓")
+    cache.close()
+    changed, same = [], []
+    for n in targets:
+        url = chapters[n - 1][1]
+        rec = cache.meta(url)
+        if not rec:
+            continue
+        (changed if cache.get(url) != before[n] else same).append(n)
+        if status == "done":  # 中斷時沒重抓完，下次還要再試
+            extra = {k: v for k, v in rec.items() if k not in ("url", "title", "content")}
+            cache.put(url, rec["title"], rec["content"], **{**extra, "retried": True})
+    cache.close()
+    return status, changed, same
+
+
+def run_and_export(args, base: str, meta: dict, cache: ChapterCache, chapters: list, job, retry=None) -> str:
+    """執行下載工作 job()，不論成功或中斷都把暫存輸出成檔案，再記錄網站速度、檢查品質。
+    chapters 為輸出順序 [(標題, 網址)]（next 模式由 job 邊下載邊加入）。
+    retry(索引清單)：下載完成後用來重抓可疑章節（有目錄時才有；args.no_retry 時不使用）。
+    回傳 "done"（完成）、"interrupted"（使用者按 Ctrl+C）或 "error"（下載失敗）。"""
+    t0 = time.time()
+    status = "error"
+    try:
+        status = _run(job)
     finally:
         cache.close()
         paths, count, chars, missing, removed = export_book(base, args.format, chapters, cache, meta)
@@ -204,9 +240,20 @@ def run_and_export(args, base: str, meta: dict, cache: ChapterCache, chapters: l
             print(f"  已記錄 {host} 的穩定速度：每秒 {rate:.1f} 頁（下次直接從這個速度開始）")
 
     warnings = check_quality(chapters, cache)
+    if warnings and retry and status == "done" and not getattr(args, "no_retry", False):
+        status, changed, same = retry_suspects(warnings, chapters, cache, retry)
+        if changed or same:
+            export_book(base, args.format, chapters, cache, meta)
+            warnings = check_quality(chapters, cache)
+            still = {n for n, _ in warnings}
+            fixed = [n for n in changed if n not in still]
+            if fixed:
+                print(f"  ✓ 重抓後已修正：第 {_ranges(fixed)} 章（輸出檔已更新）")
+            if same:
+                print(f"  重抓後內容相同：第 {_ranges(same)} 章，多半是網站本身的內容就是這樣，之後不會再自動重抓")
     if warnings:
         print(f"\n⚠ 有 {len(warnings)} 個章節可能有問題，請檢查：")
-        for w in warnings[:20]:
+        for _, w in warnings[:20]:
             print(f"  {w}")
         if len(warnings) > 20:
             print(f"  …另外還有 {len(warnings) - 20} 個")
@@ -230,15 +277,19 @@ def download_toc_book(driver, args, chapters, base: str, meta: dict) -> str:
     if skipped:
         print(f"已有 {skipped} 章下載過（暫存：{cache.path}），自動略過；要重新下載請加 --refresh")
 
+    def fetch(todo):
+        if args.slow:
+            download_by_toc(driver, chapters, todo, cache, args.delay)
+        else:
+            download_fast(driver, chapters, todo, cache, args.state, args.batch_size)
+
     def job():
         if not indices:
             print("指定範圍的章節都已下載過。")
-        elif args.slow:
-            download_by_toc(driver, chapters, indices, cache, args.delay)
         else:
-            download_fast(driver, chapters, indices, cache, args.state, args.batch_size)
+            fetch(indices)
 
-    return run_and_export(args, base, meta, cache, chapters, job)
+    return run_and_export(args, base, meta, cache, chapters, job, retry=fetch)
 
 
 def download_next_book(driver, args, base: str, meta: dict) -> str:

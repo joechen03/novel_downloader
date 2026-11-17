@@ -310,7 +310,8 @@ class TestCacheAndBook(unittest.TestCase):
         c.put("u6", "第6章", "超長，" * 30000)
         c.close()
         warnings = quality.check_quality(chapters, c)
-        text = "\n".join(warnings)
+        self.assertEqual([n for n, _ in warnings], [2, 3, 6])  # 重複時標出後面那章
+        text = "\n".join(w for _, w in warnings)
         self.assertIn("第 2 章", text)
         self.assertIn("與第 1 章相同", text)
         self.assertIn("第 6 章", text)

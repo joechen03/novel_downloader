@@ -34,6 +34,7 @@ MAX_RETRIES = 3          # 單頁失敗重試次數
 
 MIN_CONTENT_LEN = 50     # 正文少於此字數視為尚未載入完成
 
+MAX_RETRY_SUSPECTS = 100  # 下載完自動重抓的可疑章節最多幾章（太多通常是規則問題，重抓也沒用）
 MIN_TOC_LINKS = 5        # 目錄至少要有幾個章節連結才算數
 
 

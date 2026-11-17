@@ -131,6 +131,8 @@ def main() -> None:
                         help="重新下載指定範圍內的章節（預設會略過暫存中已下載的章節）")
     parser.add_argument("--reverse", action="store_true", help="目錄為新→舊排列時使用")
     parser.add_argument("--list", action="store_true", help="只列出章節清單，不下載")
+    parser.add_argument("--no-retry", action="store_true",
+                        help="下載完不要自動重抓品質檢查標出的可疑章節")
     parser.add_argument("--keep-repeated", action="store_true",
                         help="不要自動刪除每章都出現的雜訊行（網站宣傳文字、「(本章完)」等）")
     parser.add_argument("--max-pages", type=int, default=100000, help="next 模式最多抓幾章")

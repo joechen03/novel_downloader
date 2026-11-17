@@ -418,6 +418,62 @@ class TestJobs(unittest.TestCase):
             self.assertEqual((s1, s2), ("interrupted", "done"))
 
 
+class TestRetrySuspects(FlowTestCase):
+    def flaky_driver(self, times: int):
+        """第 3 章前 times 次都回傳第 1 章的內容（模擬網站暫時出錯或本身就錯）。"""
+        pages, wrong = self.pages, self.pages[chapter_url(1)]
+
+        class Flaky(FakeDriver):
+            left = times
+
+            def results(self, urls):
+                out = []
+                for u in urls:
+                    if u == chapter_url(3) and Flaky.left > 0:
+                        Flaky.left -= 1
+                        out.append(wrong)
+                    else:
+                        out.append(pages.get(u))
+                return out
+        return Flaky(pages)
+
+    def text(self) -> str:
+        with open(self.base + ".txt", encoding="utf-8") as f:
+            return f.read()
+
+    def test_transient_error_fixed(self):
+        d = self.flaky_driver(1)
+        status = downloader.download_toc_book(d, make_args(self.tmp.name), self.chapters, self.base, self.meta)
+        self.assertEqual(status, "done")
+        self.assertEqual(d.fetched.count(chapter_url(3)), 2)  # 第一次抓錯，自動重抓一次
+        self.assertIn("第3章的第0段", self.text())
+        self.assertEqual(self.text().count("第1章的第0段"), 2)  # 每段重複兩次 → 只有第 1 章本身
+
+    def test_site_error_retried_only_once(self):
+        d1 = self.flaky_driver(100)  # 網站本身就錯：重抓也一樣
+        downloader.download_toc_book(d1, make_args(self.tmp.name), self.chapters, self.base, self.meta)
+        self.assertEqual(d1.fetched.count(chapter_url(3)), 2)
+        cache = storage.ChapterCache(storage.cache_path(self.base))
+        self.assertTrue(cache.meta(chapter_url(3)).get("retried"))
+        # 再執行一次：已經重抓過，不再自動重抓
+        d2 = self.flaky_driver(100)
+        downloader.download_toc_book(d2, make_args(self.tmp.name), self.chapters, self.base, self.meta)
+        self.assertEqual(d2.fetched, [])
+        # --refresh 重新下載後標記消失（網站修好了 → 內容正確、不再可疑）
+        d3 = self.flaky_driver(0)
+        downloader.download_toc_book(d3, make_args(self.tmp.name, start=3, end=3, refresh=True),
+                                     self.chapters, self.base, self.meta)
+        cache = storage.ChapterCache(storage.cache_path(self.base))
+        self.assertFalse(cache.meta(chapter_url(3)).get("retried"))
+        self.assertIn("第3章的第0段", self.text())
+
+    def test_no_retry(self):
+        d = self.flaky_driver(1)
+        downloader.download_toc_book(d, make_args(self.tmp.name, no_retry=True), self.chapters, self.base, self.meta)
+        self.assertEqual(d.fetched.count(chapter_url(3)), 1)
+        self.assertNotIn("第3章的第0段", self.text())
+
+
 class TestTocIndex(FlowTestCase):
     def test_collect_toc_index(self):
         # 目錄首頁只有「第1-5章」「第6-10章」「第11-12章」三個範圍連結，每頁開頭都有「最新章節」
@@ -459,8 +515,8 @@ class TestChapterNumber(unittest.TestCase):
             c.close()
             warnings = quality.check_quality(chapters, c)
             self.assertEqual(len(warnings), 1)
-            self.assertIn("第 3 章", warnings[0])
-            self.assertIn("第9章 錯的", warnings[0])
+            self.assertEqual(warnings[0][0], 3)
+            self.assertIn("第9章 錯的", warnings[0][1])
 
 
 class TestOutputBase(unittest.TestCase):
